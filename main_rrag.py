@@ -11,7 +11,7 @@ This script implements:
 The paper's experimental setup (actions, episode length, agents, score) is described in Section 3.1
 and Appendix B of the PDF.
 
-Dependencies: only numpy, matplotlib (optional for plotting).
+Dependencies: numpy, scipy (for correlation analysis), matplotlib (optional for plotting).
 
 Usage:
   python main_rrag.py --env options --seed 0 --q_episodes 50000 --num_rand 1000 --epsilon 0.1 --plot
@@ -560,6 +560,190 @@ def build_aup_reward(
 
 
 # -------------------------
+# RRAG Analysis: Heuristic Policies
+# -------------------------
+
+def build_heuristic_policy_class(env, next_state: np.ndarray, gamma: float) -> List[np.ndarray]:
+    """Build a restricted policy class of interpretable heuristic policies.
+
+    These policies are used to compute order-distance between reward functions.
+    Each policy is represented as an (S,) array of action indices.
+
+    Args:
+        env: The gridworld environment (OptionsEnv or DamageEnv)
+        next_state: (S, A) transition table
+        gamma: discount factor
+
+    Returns:
+        List of policy arrays, each shape (S,)
+    """
+    S, A = next_state.shape
+    policies = []
+
+    # Policy 1: Always NOOP (maximally conservative)
+    pi_noop = np.full(S, NOOP, dtype=np.int32)
+    policies.append(pi_noop)
+
+    # Policy 2-5: Deterministic directional policies (when valid, else NOOP)
+    for action in [UP, DOWN, LEFT, RIGHT]:
+        pi = np.full(S, action, dtype=np.int32)
+        policies.append(pi)
+
+    # Policy 6: Greedy-to-goal (optimal for env_reward_s, ignoring side effects)
+    env_reward_s = np.array([env.env_reward_raw(s) for s in range(S)], dtype=np.float64)
+    _, pi_greedy, _ = solve_optimal_policy(next_state, env_reward_s, gamma)
+    policies.append(pi_greedy)
+
+    # Policy 7: Anti-greedy (reverse of greedy actions where possible)
+    # For each state, pick the action opposite to greedy
+    pi_anti = np.copy(pi_greedy)
+    opposite = {UP: DOWN, DOWN: UP, LEFT: RIGHT, RIGHT: LEFT, NOOP: NOOP}
+    for s in range(S):
+        greedy_a = int(pi_greedy[s])
+        if greedy_a in opposite:
+            anti_a = opposite[greedy_a]
+            pi_anti[s] = anti_a
+    policies.append(pi_anti)
+
+    # Policy 8-10: Mixed strategies (alternate between actions)
+    # Alternate UP/NOOP based on state index
+    pi_up_noop = np.array([UP if s % 2 == 0 else NOOP for s in range(S)], dtype=np.int32)
+    policies.append(pi_up_noop)
+
+    # Alternate RIGHT/NOOP
+    pi_right_noop = np.array([RIGHT if s % 2 == 0 else NOOP for s in range(S)], dtype=np.int32)
+    policies.append(pi_right_noop)
+
+    # Conservative greedy: mostly NOOP, but greedy in high-value states
+    pi_conservative = np.copy(pi_noop)
+    for s in range(S):
+        if env_reward_s[s] > 0.5:  # Near goal
+            pi_conservative[s] = pi_greedy[s]
+    policies.append(pi_conservative)
+
+    return policies
+
+
+def evaluate_policy_return(
+    policy: np.ndarray,
+    next_state: np.ndarray,
+    reward_s: np.ndarray,
+    start_state: int,
+    gamma: float,
+    horizon: int = 20,
+) -> float:
+    """Evaluate expected return of a policy from start_state.
+
+    For deterministic policy and environment, this is just the discounted sum
+    along the trajectory induced by the policy.
+
+    Args:
+        policy: (S,) action indices
+        next_state: (S, A) transition table
+        reward_s: (S,) state rewards
+        start_state: initial state
+        gamma: discount factor
+        horizon: evaluation horizon (episode length)
+
+    Returns:
+        Discounted return
+    """
+    s = start_state
+    ret = 0.0
+    for t in range(horizon):
+        ret += (gamma ** t) * reward_s[s]
+        a = int(policy[s])
+        s = int(next_state[s, a])
+    return ret
+
+
+def compute_order_distance(
+    next_state: np.ndarray,
+    reward1: np.ndarray,
+    reward2: np.ndarray,
+    policy_class: List[np.ndarray],
+    start_state: int,
+    gamma: float,
+    horizon: int = 20,
+) -> int:
+    """Compute order-distance between two reward functions over a policy class.
+
+    Order-distance is the number of ranking inversions: pairs of policies (μ, μ')
+    such that reward1 ranks μ > μ' but reward2 ranks μ < μ'.
+
+    Args:
+        next_state: (S, A) transition table
+        reward1: (S,) first reward function
+        reward2: (S,) second reward function
+        policy_class: list of policies to compare
+        start_state: initial state for evaluation
+        gamma: discount factor
+        horizon: evaluation horizon
+
+    Returns:
+        Order-distance (number of inversions)
+    """
+    n_policies = len(policy_class)
+
+    # Evaluate all policies under both rewards
+    returns1 = np.array([
+        evaluate_policy_return(pi, next_state, reward1, start_state, gamma, horizon)
+        for pi in policy_class
+    ])
+    returns2 = np.array([
+        evaluate_policy_return(pi, next_state, reward2, start_state, gamma, horizon)
+        for pi in policy_class
+    ])
+
+    # Count inversions
+    inversions = 0
+    for i in range(n_policies):
+        for j in range(i + 1, n_policies):
+            # Check if rankings disagree
+            if (returns1[i] > returns1[j] and returns2[i] < returns2[j]) or \
+               (returns1[i] < returns1[j] and returns2[i] > returns2[j]):
+                inversions += 1
+
+    return inversions
+
+
+def categorize_reward(env, reward_s: np.ndarray, threshold: float = 0.1) -> str:
+    """Categorize a reward function based on its treatment of side effects.
+
+    Compares average reward in states with side effects vs. states without.
+
+    Args:
+        env: The gridworld environment (OptionsEnv or DamageEnv)
+        reward_s: (S,) reward function to categorize
+        threshold: sensitivity threshold for categorization
+
+    Returns:
+        One of: "penalizes_se", "neutral", "rewards_se"
+    """
+    S = len(env.states)
+
+    # Separate states by side effect presence
+    se_states = [s for s in range(S) if env.side_effect(s)]
+    no_se_states = [s for s in range(S) if not env.side_effect(s)]
+
+    if len(se_states) == 0 or len(no_se_states) == 0:
+        return "neutral"
+
+    # Compute mean reward in each group
+    mean_se = np.mean([reward_s[s] for s in se_states])
+    mean_no_se = np.mean([reward_s[s] for s in no_se_states])
+
+    diff = mean_no_se - mean_se  # Positive if SE states have lower reward
+
+    if diff > threshold:
+        return "penalizes_se"
+    elif diff < -threshold:
+        return "rewards_se"
+    else:
+        return "neutral"
+
+
+# -------------------------
 # Held-out evaluation rewards
 # -------------------------
 
@@ -655,11 +839,22 @@ def run_experiment(
         )
         print(f"[{env_name}] {kind:8s}  vanilla={s_v:8.3f}  AUP={s_a:8.3f}  residual(AUP-vanilla)={s_a-s_v:8.3f}")
 
+    # Build heuristic policy class for RRAG analysis
+    print(f"[{env_name}] Building heuristic policy class for order-distance computation...")
+    policy_class = build_heuristic_policy_class(env, next_state, gamma)
+    print(f"[{env_name}] Policy class size: {len(policy_class)} policies")
+
     # Evaluate on D_rand: 1000 random reward functions in [0,1]^S
     rng = np.random.default_rng(seed + 2025)
     residuals = np.zeros(num_rand, dtype=np.float64)
+    order_distances = np.zeros(num_rand, dtype=np.int32)
+    categories = []
+
+    print(f"[{env_name}] Evaluating {num_rand} random rewards (with RRAG analysis)...")
     for i in range(num_rand):
         r = rng.random(len(env.states), dtype=np.float64)
+
+        # Compute specification scores
         s_v = piecewise_spec_score(
             next_state=next_state,
             start_state=start_state,
@@ -680,20 +875,182 @@ def run_experiment(
         )
         residuals[i] = s_a - s_v
 
+        # RRAG Analysis 1: Compute order-distance between R_env and this reward
+        order_distances[i] = compute_order_distance(
+            next_state=next_state,
+            reward1=env_reward_s,
+            reward2=r,
+            policy_class=policy_class,
+            start_state=start_state,
+            gamma=gamma,
+            horizon=episode_len,
+        )
+
+        # RRAG Analysis 2: Categorize this reward by side-effect treatment
+        categories.append(categorize_reward(env, r, threshold=0.1))
+
+        # Progress indicator
+        if (i + 1) % 100 == 0 or i == 0:
+            print(f"  ... {i+1}/{num_rand} complete")
+
     print(f"[{env_name}] Drand residuals over {num_rand} samples: mean={residuals.mean():.3f}, median={np.median(residuals):.3f}, p(res>0)={np.mean(residuals>0):.3f}")
+
+    # ===========================
+    # RRAG Analysis: Report Results
+    # ===========================
+    print("\n" + "=" * 60)
+    print("RRAG ANALYSIS RESULTS")
+    print("=" * 60)
+
+    # Analysis 1: Order-Distance Correlation
+    print("\n1. ORDER-DISTANCE CORRELATION ANALYSIS")
+    print(f"   Order-distance range: [{order_distances.min()}, {order_distances.max()}]")
+    print(f"   Mean order-distance: {order_distances.mean():.2f}")
+
+    # Compute correlation coefficients
+    from scipy import stats as scipy_stats
+    pearson_corr, pearson_p = scipy_stats.pearsonr(order_distances, residuals)
+    spearman_corr, spearman_p = scipy_stats.spearmanr(order_distances, residuals)
+
+    print(f"   Pearson correlation:  r={pearson_corr:.4f}, p={pearson_p:.4e}")
+    print(f"   Spearman correlation: ρ={spearman_corr:.4f}, p={spearman_p:.4e}")
+
+    if pearson_corr > 0.1:
+        print(f"   ✓ Positive correlation supports RRAG theory (Corollary 1)")
+    else:
+        print(f"   ✗ Weak/negative correlation - RRAG prediction not validated")
+
+    # Analysis 2: Category-wise Performance
+    print("\n2. SIDE-EFFECT CATEGORIZATION ANALYSIS")
+    categories_array = np.array(categories)
+    unique_cats = ["penalizes_se", "neutral", "rewards_se"]
+
+    for cat in unique_cats:
+        mask = categories_array == cat
+        count = mask.sum()
+        if count > 0:
+            mean_res = residuals[mask].mean()
+            median_res = np.median(residuals[mask])
+            print(f"   {cat:15s}: n={count:4d}, mean_residual={mean_res:7.3f}, median={median_res:7.3f}")
+        else:
+            print(f"   {cat:15s}: n=0 (no samples)")
+
+    # Check if prediction holds: AUP advantage should be largest for penalizes_se
+    mask_pen = categories_array == "penalizes_se"
+    mask_rew = categories_array == "rewards_se"
+    if mask_pen.sum() > 0 and mask_rew.sum() > 0:
+        mean_pen = residuals[mask_pen].mean()
+        mean_rew = residuals[mask_rew].mean()
+        if mean_pen > mean_rew:
+            print(f"   ✓ AUP advantage largest when side effects penalized (RRAG prediction)")
+        else:
+            print(f"   ✗ AUP advantage not largest for penalized SE (unexpected)")
+
+    print("=" * 60 + "\n")
 
     if plot:
         import matplotlib.pyplot as plt
 
-        plt.figure()
-        plt.hist(residuals, bins=60, density=True)
-        plt.xlabel("Score Differential (AUP - Vanilla)")
-        plt.ylabel("Density")
-        plt.title(f"{env_name}: Piecewise specification score residuals (Drand)")
+        # Create a comprehensive 3-panel figure
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Plot 1: Original histogram
+        axes[0].hist(residuals, bins=60, density=True, alpha=0.7, color='steelblue', edgecolor='black')
+        axes[0].axvline(0, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+        axes[0].set_xlabel("Score Differential (AUP - Vanilla)", fontsize=11)
+        axes[0].set_ylabel("Density", fontsize=11)
+        axes[0].set_title(f"(a) Residual Distribution", fontsize=12, fontweight='bold')
+        axes[0].grid(True, alpha=0.3)
+
+        # Plot 2: Order-distance scatter plot with trend line
+        axes[1].scatter(order_distances, residuals, alpha=0.4, s=20, color='steelblue', edgecolor='none')
+
+        # Add trend line
+        z = np.polyfit(order_distances, residuals, 1)
+        p = np.poly1d(z)
+        x_trend = np.linspace(order_distances.min(), order_distances.max(), 100)
+        axes[1].plot(x_trend, p(x_trend), "r-", linewidth=2, alpha=0.8, label=f'Linear fit (r={pearson_corr:.3f})')
+
+        axes[1].axhline(0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        axes[1].set_xlabel("Order-Distance D(R_env, R)", fontsize=11)
+        axes[1].set_ylabel("AUP Advantage (residual)", fontsize=11)
+        axes[1].set_title(f"(b) Order-Distance Correlation", fontsize=12, fontweight='bold')
+        axes[1].legend(fontsize=10)
+        axes[1].grid(True, alpha=0.3)
+
+        # Plot 3: Category comparison box plot
+        categories_array = np.array(categories)
+        category_data = []
+        category_labels = []
+        category_colors = {'penalizes_se': 'lightcoral', 'neutral': 'lightgray', 'rewards_se': 'lightgreen'}
+
+        for cat in ["penalizes_se", "neutral", "rewards_se"]:
+            mask = categories_array == cat
+            if mask.sum() > 0:
+                category_data.append(residuals[mask])
+                label_with_count = f"{cat}\n(n={mask.sum()})"
+                category_labels.append(label_with_count)
+
+        bp = axes[2].boxplot(category_data, labels=category_labels, patch_artist=True, widths=0.6)
+
+        # Color the boxes
+        for patch, cat in zip(bp['boxes'], ["penalizes_se", "neutral", "rewards_se"]):
+            if cat in ["penalizes_se", "neutral", "rewards_se"][:len(category_data)]:
+                patch.set_facecolor(category_colors[cat])
+                patch.set_alpha(0.7)
+
+        axes[2].axhline(0, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+        axes[2].set_ylabel("AUP Advantage (residual)", fontsize=11)
+        axes[2].set_xlabel("Side-Effect Treatment", fontsize=11)
+        axes[2].set_title(f"(c) Categorization Analysis", fontsize=12, fontweight='bold')
+        axes[2].grid(True, alpha=0.3, axis='y')
+
+        plt.suptitle(f"{env_name.capitalize()} Environment: RRAG Analysis (Drand n={num_rand})",
+                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
-        plt.savefig(f"figs/rrag_drand_residuals_hist_{env_name}.png", dpi=200)
+
+        # Save the comprehensive figure
+        save_path = f"figs/rrag_analysis_{env_name}.png"
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
         plt.close()
-        print(f"save to `rrag_drand_residuals_hist_{env_name}.png`")
+        print(f"\n[Plot] Saved comprehensive RRAG analysis to: {save_path}")
+
+        # Also save individual plots for paper figures
+        # Individual plot 1: Order-distance scatter
+        fig_od, ax_od = plt.subplots(1, 1, figsize=(6, 5))
+        ax_od.scatter(order_distances, residuals, alpha=0.5, s=30, color='steelblue', edgecolor='black', linewidth=0.5)
+        z = np.polyfit(order_distances, residuals, 1)
+        p = np.poly1d(z)
+        x_trend = np.linspace(order_distances.min(), order_distances.max(), 100)
+        ax_od.plot(x_trend, p(x_trend), "r-", linewidth=2.5, alpha=0.8)
+        ax_od.axhline(0, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
+        ax_od.set_xlabel("Order-Distance D(R_env, R)", fontsize=13)
+        ax_od.set_ylabel("AUP Advantage", fontsize=13)
+        ax_od.set_title(f"{env_name.capitalize()}: Order-Distance vs. AUP Advantage\nr={pearson_corr:.4f}, p={pearson_p:.2e}",
+                       fontsize=13, fontweight='bold')
+        ax_od.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"figs/rrag_order_distance_{env_name}.png", dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"[Plot] Saved order-distance plot to: figs/rrag_order_distance_{env_name}.png")
+
+        # Individual plot 2: Category box plot
+        fig_cat, ax_cat = plt.subplots(1, 1, figsize=(7, 5))
+        bp2 = ax_cat.boxplot(category_data, labels=category_labels, patch_artist=True, widths=0.5)
+        for patch, cat in zip(bp2['boxes'], ["penalizes_se", "neutral", "rewards_se"][:len(category_data)]):
+            patch.set_facecolor(category_colors[cat])
+            patch.set_alpha(0.7)
+            patch.set_edgecolor('black')
+            patch.set_linewidth(1.5)
+        ax_cat.axhline(0, color='red', linestyle='--', linewidth=2, alpha=0.7)
+        ax_cat.set_ylabel("AUP Advantage", fontsize=13)
+        ax_cat.set_xlabel("Reward Category", fontsize=13)
+        ax_cat.set_title(f"{env_name.capitalize()}: AUP Advantage by Side-Effect Treatment", fontsize=13, fontweight='bold')
+        ax_cat.grid(True, alpha=0.3, axis='y')
+        plt.tight_layout()
+        plt.savefig(f"figs/rrag_categories_{env_name}.png", dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"[Plot] Saved category plot to: figs/rrag_categories_{env_name}.png")
 
 
 def main() -> None:
