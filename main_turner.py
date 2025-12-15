@@ -14,8 +14,8 @@ and Appendix B of the PDF.
 Dependencies: only numpy, matplotlib (optional for plotting).
 
 Usage:
-  python main.py --env options
-  python main.py --env damage
+  python main_turner.py --env options
+  python main_turner.py --env damage
 
 Notes:
   - The tile layouts are inferred from the paper's Fig. 1 (small schematic).
