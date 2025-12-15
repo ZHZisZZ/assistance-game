@@ -1,6 +1,3 @@
-# python main.py --env damage --plot
-# python main.py --env options --plot
-
 """Reproduce Section 3 experiments from
 "Formalizing the Problem of Side Effect Regularization" (Turner, Saxena, Tadepalli; 2022).
 
@@ -17,8 +14,8 @@ and Appendix B of the PDF.
 Dependencies: only numpy, matplotlib (optional for plotting).
 
 Usage:
-  python reproduce_section3.py --env options
-  python reproduce_section3.py --env damage
+  python main.py --env options
+  python main.py --env damage
 
 Notes:
   - The tile layouts are inferred from the paper's Fig. 1 (small schematic).
